@@ -376,6 +376,14 @@ type autoCloseProxyAdapter struct {
 	closeErr  error
 }
 
+// A host that looks for a specific adapter gets the one it wrapped, since this
+// type is what every proxy in the tunnel is behind. any rather than
+// ProxyAdapter, so the search can name the interface without this package's
+// own, which is not the type the adapter package hands out.
+func (p *autoCloseProxyAdapter) UnwrapProxyAdapter() any {
+	return p.ProxyAdapter
+}
+
 func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	c, err := p.ProxyAdapter.DialContext(ctx, metadata)
 	if err != nil {

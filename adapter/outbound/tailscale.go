@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,17 +23,25 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
 
 	ts "github.com/metacubex/tailscale"
 	"github.com/metacubex/tailscale/envknob"
 	"github.com/metacubex/tailscale/hostinfo"
 	"github.com/metacubex/tailscale/ipn"
+	"github.com/metacubex/tailscale/ipn/ipnstate"
 	"github.com/metacubex/tailscale/net/netmon"
 	"github.com/metacubex/tailscale/tailcfg"
 	"github.com/metacubex/tailscale/tsnet"
+	"github.com/metacubex/tailscale/types/key"
 	D "github.com/miekg/dns"
 	"github.com/samber/lo"
 )
+
+// A host that shows the node needs the states it was not watching for, such as
+// the first Running after a login. The adapter is started before the host can
+// ask, so the changes come as calls rather than as a watcher of its own.
+var TailscaleStatusHook func(status *TailscaleStatus)
 
 type Tailscale struct {
 	*Base
@@ -47,6 +58,18 @@ type Tailscale struct {
 	backendInitErr  error
 
 	serverStarted bool
+
+	// The login URL control answered with. It is the only way back to an
+	// unfinished login: the watcher sees it once, when control first asks.
+	authURLMu sync.Mutex
+	authURL   string
+
+	// Set once a browser login was started for this node, which is what makes
+	// the signed-in key an interactive one rather than the pre-auth key. It is
+	// kept in the state directory because the process outlives no restart, and
+	// the pre-auth key in the config would otherwise claim the credit.
+	browserLoginMu sync.Mutex
+	browserLogin   bool
 
 	unregisterDNSResolver func()
 }
@@ -183,8 +206,246 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	return outbound, nil
 }
 
+// StartTailscale starts the backend of the Tailscale outbound named name so a
+// host can reach its status without dialing through it first. An outbound of
+// another type, or none at all, is not an error here; the caller finds out
+// from the status.
+func StartTailscale(name string) error {
+	outbound, ok := tailscaleByName(name)
+	if !ok {
+		return nil
+	}
+	return outbound.start()
+}
+
+// TailscaleStatusOf reports what the backend of the outbound named name knows
+// now. It reads the status the backend has rather than starting one, so a host
+// that asks about a node it has not brought up gets no answer instead of a
+// backend of its own. A nil status with a nil error means either no Tailscale
+// outbound carries that name or its backend has not been started.
+func TailscaleStatusOf(name string) (*TailscaleStatus, error) {
+	outbound, ok := tailscaleByName(name)
+	if !ok {
+		return nil, nil
+	}
+	return outbound.status()
+}
+
+// LoginTailscale asks the node for the URL a browser has to open. A node that
+// is already signed in has none, and one that never started has no browser
+// login to finish, so both answer with the empty string rather than an error.
+//
+// Control is what produces the URL, so the call waits for the watcher to see
+// it: asking is the only way to get one for a node that lost the first.
+func LoginTailscale(name string) (string, error) {
+	outbound, ok := tailscaleByName(name)
+	if !ok {
+		return "", nil
+	}
+	if err := outbound.start(); err != nil {
+		return "", err
+	}
+	select {
+	case <-outbound.backendInitCh:
+		if outbound.backendInitErr != nil {
+			return "", outbound.backendInitErr
+		}
+	default:
+		return "", nil
+	}
+	if url := outbound.storedAuthURL(); url != "" {
+		outbound.markBrowserLogin()
+		return url, nil
+	}
+	local, err := outbound.server.LocalClient()
+	if err != nil {
+		return "", err
+	}
+	status, err := local.Status(context.Background())
+	if err != nil {
+		return "", err
+	}
+	if status.AuthURL != "" {
+		outbound.setAuthURL(status.AuthURL)
+		outbound.markBrowserLogin()
+		return status.AuthURL, nil
+	}
+	// A node that is signed in needs nothing, and asking would log it out.
+	if status.BackendState != ipn.NeedsLogin.String() && status.BackendState != ipn.Stopped.String() {
+		return "", nil
+	}
+	ctx, cancel := context.WithTimeout(outbound.ctx, 30*time.Second)
+	defer cancel()
+	if err := local.StartLoginInteractive(ctx); err != nil {
+		return "", err
+	}
+	outbound.markBrowserLogin()
+	// The URL arrives as a notification, so it is waited for rather than read.
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+			if url := outbound.storedAuthURL(); url != "" {
+				return url, nil
+			}
+			latest, err := local.Status(context.Background())
+			if err != nil {
+				continue
+			}
+			if latest.AuthURL != "" {
+				outbound.setAuthURL(latest.AuthURL)
+				return latest.AuthURL, nil
+			}
+		}
+	}
+}
+
+// LogoutTailscale signs the node of the outbound named name out, which drops
+// the key it keeps in its state directory so another account can claim it.
+func LogoutTailscale(name string) error {
+	outbound, ok := tailscaleByName(name)
+	if !ok {
+		return nil
+	}
+	local, err := outbound.server.LocalClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(outbound.ctx, 30*time.Second)
+	defer cancel()
+	if err := local.Logout(ctx); err != nil {
+		return err
+	}
+	// The next login decides the method again, so what this one used is not
+	// kept.
+	outbound.clearBrowserLogin()
+	return nil
+}
+
+func tailscaleByName(name string) (*Tailscale, bool) {
+	proxy := tunnel.AllProxies()[name]
+	if proxy == nil {
+		return nil, false
+	}
+	// Adapter() rather than a type assertion on the concrete proxy: this
+	// package cannot import the adapter package that builds it. The tunnel
+	// wraps every adapter in autoCloseProxyAdapter, so the search unwraps it.
+	var adapter any = proxy.Adapter()
+	if unwrapper, ok := adapter.(interface{ UnwrapProxyAdapter() any }); ok {
+		adapter = unwrapper.UnwrapProxyAdapter()
+	}
+	tailscale, ok := adapter.(*Tailscale)
+	return tailscale, ok
+}
+
+func (t *Tailscale) status() (*TailscaleStatus, error) {
+	select {
+	case <-t.backendInitCh:
+		if t.backendInitErr != nil {
+			return nil, t.backendInitErr
+		}
+	default:
+		// start() has not run, so there is no backend to report on yet.
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
+	defer cancel()
+	local, err := t.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	self, err := local.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	authURL := self.AuthURL
+	if authURL == "" {
+		authURL = t.storedAuthURL()
+	}
+	status := &TailscaleStatus{
+		Name:         t.Name(),
+		BackendState: self.BackendState,
+		AuthURL:      authURL,
+		HaveNodeKey:  self.HaveNodeKey,
+		AuthMethod:   t.authMethod(),
+		Online:       self.BackendState == ipn.Running.String(),
+		MagicDNS:     self.MagicDNSSuffix,
+		IPs:          addressesOf(self.TailscaleIPs),
+		Health:       self.Health,
+	}
+	if self.Self != nil {
+		status.Hostname = self.Self.HostName
+		status.DNSName = self.Self.DNSName
+			status.ExitNode = peerStatusOf(self.ExitNodeStatus, self.Peer)
+	}
+	status.Peers = make([]TailscalePeer, 0, len(self.Peer))
+	for _, peer := range self.Peer {
+		status.Peers = append(status.Peers, TailscalePeer{
+			Hostname:       peer.HostName,
+			DNSName:        peer.DNSName,
+			OS:             peer.OS,
+			IPs:            addressesOf(peer.TailscaleIPs),
+			Online:         peer.Online,
+			ExitNodeOption: peer.ExitNodeOption,
+			ExitNode:       peer.ExitNode,
+			Relay:          peer.Relay,
+			CurAddr:        peer.CurAddr,
+			RxBytes:        peer.RxBytes,
+			TxBytes:        peer.TxBytes,
+		})
+	}
+	sort.Slice(status.Peers, func(i, j int) bool {
+		return status.Peers[i].Hostname < status.Peers[j].Hostname
+	})
+	return status, nil
+}
+
+// The exit node's status carries its addresses to dial; the peer entry of the
+// same node carries what a list shows.
+func peerStatusOf(exitNode *ipnstate.ExitNodeStatus, peers map[key.NodePublic]*ipnstate.PeerStatus) *TailscalePeer {
+	if exitNode == nil {
+		return nil
+	}
+	for _, peer := range peers {
+		if peer.ID == exitNode.ID {
+			return &TailscalePeer{
+				Hostname:       peer.HostName,
+				DNSName:        peer.DNSName,
+				OS:             peer.OS,
+				IPs:            addressesOf(peer.TailscaleIPs),
+				Online:         peer.Online,
+				ExitNodeOption: peer.ExitNodeOption,
+				ExitNode:       true,
+				Relay:          peer.Relay,
+				CurAddr:        peer.CurAddr,
+				RxBytes:        peer.RxBytes,
+				TxBytes:        peer.TxBytes,
+			}
+		}
+	}
+	addresses := make([]string, 0, len(exitNode.TailscaleIPs))
+	for _, prefix := range exitNode.TailscaleIPs {
+		addresses = append(addresses, prefix.Addr().String())
+	}
+	return &TailscalePeer{IPs: addresses, ExitNode: true}
+}
+
+func addressesOf(addresses []netip.Addr) []string {
+	result := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		result = append(result, address.String())
+	}
+	return result
+}
+
 func (t *Tailscale) start() error {
 	t.startOnce.Do(func() {
+		// Read before the backend publishes anything, so the first status
+		// already names the way this node was signed in.
+		t.loadBrowserLogin()
 		if err := t.server.Start(); err != nil {
 			t.startErr = err
 			t.setBackendInitialized(err)
@@ -225,11 +486,15 @@ func (t *Tailscale) watchBackendState() {
 
 	backendInitialized := false
 	exitNodeNeedsStatus := tailscaleExitNodeNeedsStatus(t.option)
+	exitNodeApplied := false
 	for {
 		n, err := watcher.Next()
 		if err != nil {
 			t.setBackendInitialized(err)
 			return
+		}
+		if n.BrowseToURL != nil && *n.BrowseToURL != "" {
+			t.setAuthURL(*n.BrowseToURL)
 		}
 		if n.State == nil {
 			continue
@@ -238,17 +503,95 @@ func (t *Tailscale) watchBackendState() {
 		if *n.State != ipn.NoState && !backendInitialized {
 			t.setBackendInitialized(nil)
 			backendInitialized = true
-			if !exitNodeNeedsStatus {
-				return
-			}
 		}
-		if exitNodeNeedsStatus && *n.State == ipn.Running {
+		if exitNodeNeedsStatus && *n.State == ipn.Running && !exitNodeApplied {
+			exitNodeApplied = true
 			if err := t.applyExitNodePrefs(t.ctx); err != nil {
 				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
 			}
-			return
 		}
+		// The exit-node prefs are a change of their own, and the status that
+		// follows them is the one a page should show.
+		if exitNodeNeedsStatus && !exitNodeApplied {
+			continue
+		}
+		t.publishStatus()
 	}
+}
+
+func (t *Tailscale) publishStatus() {
+	if TailscaleStatusHook == nil {
+		return
+	}
+	status, err := t.status()
+	if err != nil || status == nil {
+		return
+	}
+	TailscaleStatusHook(status)
+}
+
+func (t *Tailscale) setAuthURL(url string) {
+	t.authURLMu.Lock()
+	t.authURL = url
+	t.authURLMu.Unlock()
+	t.publishStatus()
+}
+
+const tailscaleBrowserLoginMarker = "browser-login"
+
+func (t *Tailscale) markBrowserLogin() {
+	t.browserLoginMu.Lock()
+	taken := t.browserLogin
+	t.browserLogin = true
+	t.browserLoginMu.Unlock()
+	if taken {
+		return
+	}
+	// A failure here costs the answer to "which way was this signed in", not
+	// the login, so it is not worth failing the call over.
+	_ = os.WriteFile(t.browserLoginPath(), nil, 0o600)
+}
+
+func (t *Tailscale) browserLoginPath() string {
+	return filepath.Join(t.option.StateDir, tailscaleBrowserLoginMarker)
+}
+
+// A leftover marker is what says a browser login signed this node in; the key
+// in the config may well still be there and unused.
+func (t *Tailscale) loadBrowserLogin() {
+	if _, err := os.Stat(t.browserLoginPath()); err == nil {
+		t.browserLoginMu.Lock()
+		t.browserLogin = true
+		t.browserLoginMu.Unlock()
+	}
+}
+
+func (t *Tailscale) clearBrowserLogin() {
+	t.browserLoginMu.Lock()
+	t.browserLogin = false
+	t.browserLoginMu.Unlock()
+	_ = os.Remove(t.browserLoginPath())
+}
+
+// An interactive login wins over a pre-auth key: it only happens when the key
+// did not sign the node in, or when there was no key to begin with.
+func (t *Tailscale) authMethod() string {
+	t.browserLoginMu.Lock()
+	browser := t.browserLogin
+	t.browserLoginMu.Unlock()
+	if browser {
+		return "browser"
+	}
+	if t.option.AuthKey != "" {
+		return "auth-key"
+	}
+	return ""
+}
+
+func (t *Tailscale) storedAuthURL() string {
+	t.authURLMu.Lock()
+	defer t.authURLMu.Unlock()
+	return t.authURL
 }
 
 func (t *Tailscale) setBackendInitialized(err error) {

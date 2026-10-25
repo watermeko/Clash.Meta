@@ -254,7 +254,6 @@ func LoginTailscale(name string) (string, error) {
 		return "", nil
 	}
 	if url := outbound.storedAuthURL(); url != "" {
-		outbound.markBrowserLogin()
 		return url, nil
 	}
 	local, err := outbound.server.LocalClient()
@@ -267,7 +266,6 @@ func LoginTailscale(name string) (string, error) {
 	}
 	if status.AuthURL != "" {
 		outbound.setAuthURL(status.AuthURL)
-		outbound.markBrowserLogin()
 		return status.AuthURL, nil
 	}
 	// A node that is signed in needs nothing, and asking would log it out.
@@ -279,7 +277,6 @@ func LoginTailscale(name string) (string, error) {
 	if err := local.StartLoginInteractive(ctx); err != nil {
 		return "", err
 	}
-	outbound.markBrowserLogin()
 	// The URL arrives as a notification, so it is waited for rather than read.
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -379,7 +376,7 @@ func (t *Tailscale) status() (*TailscaleStatus, error) {
 	if self.Self != nil {
 		status.Hostname = self.Self.HostName
 		status.DNSName = self.Self.DNSName
-			status.ExitNode = peerStatusOf(self.ExitNodeStatus, self.Peer)
+		status.ExitNode = peerStatusOf(self.ExitNodeStatus, self.Peer)
 	}
 	status.Peers = make([]TailscalePeer, 0, len(self.Peer))
 	for _, peer := range self.Peer {
@@ -504,6 +501,13 @@ func (t *Tailscale) watchBackendState() {
 			t.setBackendInitialized(nil)
 			backendInitialized = true
 		}
+		// A login counts once control signs the node in, and a browser login is
+		// one that this host finished by opening a page: marking it when the
+		// page opened would credit a login that never happened.
+		if *n.State == ipn.Running && t.storedAuthURL() != "" {
+			t.markBrowserLogin()
+			t.clearAuthURL()
+		}
 		if exitNodeNeedsStatus && *n.State == ipn.Running && !exitNodeApplied {
 			exitNodeApplied = true
 			if err := t.applyExitNodePrefs(t.ctx); err != nil {
@@ -575,17 +579,52 @@ func (t *Tailscale) clearBrowserLogin() {
 
 // An interactive login wins over a pre-auth key: it only happens when the key
 // did not sign the node in, or when there was no key to begin with.
+//
+// The two are alternatives rather than parallel routes, so the key is reported
+// only while the node itself holds a key control issued: a node still waiting
+// for a sign-in has not been claimed by either yet, and reporting the key there
+// would name a way of signing in that never happened.
 func (t *Tailscale) authMethod() string {
 	t.browserLoginMu.Lock()
 	browser := t.browserLogin
 	t.browserLoginMu.Unlock()
+	return authMethodOf(browser, t.option.AuthKey, t.haveNodeKey())
+}
+
+// The rule the page shows, kept apart from the node so it can be checked
+// without one: a browser login wins over the key the profile carries, because
+// a key is only a way to sign in, not the record of having done it.
+func authMethodOf(browser bool, authKey string, signedIn bool) string {
 	if browser {
 		return "browser"
 	}
-	if t.option.AuthKey != "" {
+	if authKey != "" && signedIn {
 		return "auth-key"
 	}
 	return ""
+}
+
+// Whether control issued this node a key, which is what says it is signed in
+// rather than only configured with a way to sign in.
+func (t *Tailscale) haveNodeKey() bool {
+	if !t.serverStarted || t.server == nil {
+		return false
+	}
+	local, err := t.server.LocalClient()
+	if err != nil {
+		return false
+	}
+	status, err := local.Status(context.Background())
+	if err != nil {
+		return false
+	}
+	return status.HaveNodeKey && status.BackendState == ipn.Running.String()
+}
+
+func (t *Tailscale) clearAuthURL() {
+	t.authURLMu.Lock()
+	t.authURL = ""
+	t.authURLMu.Unlock()
 }
 
 func (t *Tailscale) storedAuthURL() string {

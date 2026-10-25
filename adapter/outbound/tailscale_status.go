@@ -19,11 +19,11 @@ type TailscaleStatus struct {
 	// "browser" when the login was finished in a browser, and empty when it
 	// has no key to explain. Control treats the two the same once signed in,
 	// so the outbound is what remembers which one was used.
-	AuthMethod  string          `json:"auth-method,omitempty"`
-	IPs         []string        `json:"ips"`
-	Health      []string        `json:"health"`
-	ExitNode    *TailscalePeer  `json:"exit-node,omitempty"`
-	Peers       []TailscalePeer `json:"peers"`
+	AuthMethod string          `json:"auth-method,omitempty"`
+	IPs        []string        `json:"ips"`
+	Health     []string        `json:"health"`
+	ExitNode   *TailscalePeer  `json:"exit-node,omitempty"`
+	Peers      []TailscalePeer `json:"peers"`
 }
 
 type TailscalePeer struct {

@@ -232,8 +232,8 @@ func TailscaleStatusOf(name string) (*TailscaleStatus, error) {
 }
 
 // LoginTailscale asks the node for the URL a browser has to open. A node that
-// is already signed in has none, and one that never started has no browser
-// login to finish, so both answer with the empty string rather than an error.
+// is already signed in has none, so it answers with the empty string rather
+// than an error.
 //
 // Control is what produces the URL, so the call waits for the watcher to see
 // it: asking is the only way to get one for a node that lost the first.
@@ -245,13 +245,11 @@ func LoginTailscale(name string) (string, error) {
 	if err := outbound.start(); err != nil {
 		return "", err
 	}
-	select {
-	case <-outbound.backendInitCh:
-		if outbound.backendInitErr != nil {
-			return "", outbound.backendInitErr
-		}
-	default:
-		return "", nil
+	// Waiting rather than reading the channel is what keeps a login asked for
+	// during the node's first seconds from looking like a node that needs no
+	// login at all: the host reports the empty answer as "already signed in".
+	if err := outbound.waitBackendInitialized(outbound.ctx); err != nil {
+		return "", err
 	}
 	if url := outbound.storedAuthURL(); url != "" {
 		return url, nil
@@ -339,13 +337,20 @@ func tailscaleByName(name string) (*Tailscale, bool) {
 }
 
 func (t *Tailscale) status() (*TailscaleStatus, error) {
+	// A node that no apply has started is not one with nothing to say: the
+	// host asked about it, which is reason enough to bring it up. Answering
+	// with no status instead is what left a fresh install on "starting" for
+	// as long as nothing dialed through the node.
+	if err := t.start(); err != nil {
+		return nil, err
+	}
 	select {
 	case <-t.backendInitCh:
 		if t.backendInitErr != nil {
 			return nil, t.backendInitErr
 		}
 	default:
-		// start() has not run, so there is no backend to report on yet.
+		// Started, but the watcher has not seen a state yet.
 		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)

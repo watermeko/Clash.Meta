@@ -46,3 +46,10 @@ type EasyTierOption struct {
 func NewEasyTier(EasyTierOption) (*EasyTier, error) {
 	return nil, fmt.Errorf("EasyTier support is disabled by \"no_easytier\" build tag")
 }
+
+// The overlay state of the outbound named by name. A build without EasyTier
+// answers as if no such outbound were configured, which keeps a page from
+// claiming a node that cannot exist here.
+func EasyTierStatusOf(string) (*EasyTierStatus, error) {
+	return nil, nil
+}

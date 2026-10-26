@@ -19,6 +19,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
 
 	corehost "github.com/easytier/easytier/easytier-go"
 	D "github.com/miekg/dns"
@@ -30,6 +31,9 @@ const (
 	easyTierDNSTTL          = 60
 	easyTierMinBackoff      = time.Second
 	easyTierMaxBackoff      = 30 * time.Second
+	// A status read is a query about a running node, so it is bounded: a node
+	// that cannot answer is reported as such rather than hanging the caller.
+	easyTierStatusTimeout = 5 * time.Second
 )
 
 var errEasyTierClosed = errors.New("easytier outbound closed")
@@ -500,6 +504,147 @@ func (e *EasyTier) ProxyInfo() C.ProxyInfo {
 
 func (e *EasyTier) IsL3Protocol(*C.Metadata) bool {
 	return true
+}
+
+// EasyTierStatusOf reads the overlay state of the outbound named by name, for
+// a host that wants to show it without dialing through it first. A name that
+// is not an EasyTier outbound answers with nil, which is what a page reads as
+// "no node here" rather than a failure.
+func EasyTierStatusOf(name string) (*EasyTierStatus, error) {
+	outbound, ok := easyTierByName(name)
+	if !ok {
+		return nil, nil
+	}
+	return outbound.StatusOf(context.Background()), nil
+}
+
+func easyTierByName(name string) (*EasyTier, bool) {
+	proxy := tunnel.AllProxies()[name]
+	if proxy == nil {
+		return nil, false
+	}
+	// Adapter() rather than a type assertion on the concrete proxy: this
+	// package cannot import the adapter package that builds it. The tunnel
+	// wraps every adapter in autoCloseProxyAdapter, so the search unwraps it.
+	var adapter any = proxy.Adapter()
+	if unwrapper, ok := adapter.(interface{ UnwrapProxyAdapter() any }); ok {
+		adapter = unwrapper.UnwrapProxyAdapter()
+	}
+	easyTier, ok := adapter.(*EasyTier)
+	return easyTier, ok
+}
+
+// StatusOf reports what this outbound has reached, for a host that wants to
+// show the overlay without dialing through it. A node that has not started
+// answers with its state rather than an error: the host asked about it, which
+// is reason enough to bring it up, in the same way a Tailscale node answers.
+func (e *EasyTier) StatusOf(ctx context.Context) *EasyTierStatus {
+	status := &EasyTierStatus{
+		Name:        e.Name(),
+		State:       "created",
+		Hostname:    e.option.Hostname,
+		NetworkName: e.option.NetworkName,
+	}
+
+	e.mu.Lock()
+	instance := e.instance
+	instanceID := e.instanceID
+	e.mu.Unlock()
+	status.InstanceID = instanceID
+	if instance != nil {
+		status.State = easyTierStateName(instance.State())
+	}
+	if instance == nil {
+		// Nothing has started yet. Starting here would be a side effect of a
+		// read, and unlike Tailscale this node needs no login to come up: the
+		// apply that installed it starts it.
+		return status
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, easyTierStatusTimeout)
+	defer cancel()
+	if info, err := instance.ShowNodeInfo(readCtx); err == nil && info != nil {
+		status.Hostname = info.GetHostname()
+		if addr, parseErr := easytier.ParseNodeIPv4(info.GetIpv4Addr()); parseErr == nil {
+			status.IPv4 = addr.String()
+		}
+	}
+	routes, err := instance.ListRoute(readCtx)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	// The tunnel a peer is reached over, keyed by its id, so a route that
+	// travels through it can name the transport.
+	tunnels := e.tunnelsOf(readCtx, instance)
+	for _, route := range routes {
+		if route == nil {
+			continue
+		}
+		inet := route.GetIpv4Addr()
+		if inet == nil || inet.GetAddress() == nil {
+			continue
+		}
+		// Only a direct path has a tunnel of its own; a relayed route counts
+		// through the peer it hands to, which is what makes the two kinds
+		// readable apart.
+		tunnel := ""
+		if routeCost := route.GetCost(); routeCost == 1 {
+			tunnel = tunnels[route.GetPeerId()]
+		}
+		status.Peers = append(status.Peers, EasyTierPeer{
+			Hostname:  route.GetHostname(),
+			IPv4:      easytier.IPv4FromUint32(inet.GetAddress().GetAddr()).String(),
+			PathLen:   int(route.GetCost()),
+			LatencyMs: int64(route.GetPathLatency()),
+			Tunnel:    tunnel,
+		})
+	}
+	status.Connected = len(status.Peers) > 0
+	return status
+}
+
+// The name a host reads for a node's state. easytier-go's State is an enum of
+// numbered values with no text of its own, so the names live here.
+func easyTierStateName(state corehost.State) string {
+	switch state {
+	case corehost.StateCreated:
+		return "created"
+	case corehost.StateStarting:
+		return "starting"
+	case corehost.StateRunning:
+		return "running"
+	case corehost.StateStopping:
+		return "stopping"
+	case corehost.StateStopped:
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+// The transport each peer is reached over, for a node that reports one.
+func (e *EasyTier) tunnelsOf(ctx context.Context, instance *corehost.Instance) map[uint32]string {
+	tunnels := make(map[uint32]string)
+	peers, err := instance.ListPeer(ctx)
+	if err != nil {
+		return tunnels
+	}
+	for _, peer := range peers {
+		if peer == nil || len(peer.GetConns()) == 0 {
+			continue
+		}
+		for _, conn := range peer.GetConns() {
+			if conn == nil || conn.GetIsClosed() {
+				continue
+			}
+			if tunnel := conn.GetTunnel(); tunnel != nil && tunnel.GetTunnelType() != "" {
+				tunnels[peer.GetPeerId()] = tunnel.GetTunnelType()
+				break
+			}
+		}
+	}
+	return tunnels
 }
 
 func (e *EasyTier) Close() error {

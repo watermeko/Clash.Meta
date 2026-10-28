@@ -26,6 +26,8 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 
 	ts "github.com/metacubex/tailscale"
+	"github.com/metacubex/tailscale-wireguard-go/tun"
+	"github.com/metacubex/tailscale/client/local"
 	"github.com/metacubex/tailscale/envknob"
 	"github.com/metacubex/tailscale/hostinfo"
 	"github.com/metacubex/tailscale/ipn"
@@ -46,6 +48,7 @@ var TailscaleStatusHook func(status *TailscaleStatus)
 type Tailscale struct {
 	*Base
 	server      *tsnet.Server
+	overlayTun  *tailscaleTunDevice
 	dnsResolver *dns.Resolver
 	option      TailscaleOption
 	ctx         context.Context
@@ -84,7 +87,10 @@ type TailscaleOption struct {
 	Ephemeral  bool   `proxy:"ephemeral,omitempty"`
 	UDP        bool   `proxy:"udp,omitempty"`
 
-	AcceptRoutes           *bool  `proxy:"accept-routes,omitempty"`
+	AcceptRoutes *bool `proxy:"accept-routes,omitempty"`
+	// Whether the node carries the tailnet as an interface of its own, so a peer
+	// reaches any local port without a rule naming it.
+	OverlayTun             *bool  `proxy:"overlay-tun,omitempty"`
 	ExitNode               string `proxy:"exit-node,omitempty"`
 	ExitNodeAllowLANAccess *bool  `proxy:"exit-node-allow-lan-access,omitempty"`
 }
@@ -168,7 +174,21 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		backendInitCh: make(chan struct{}),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+	// The device has to exist before the engine is built, and its address only
+	// arrives once the control plane has answered, so it starts without one.
+	if option.OverlayTun == nil || *option.OverlayTun {
+		if device, err := openTailscaleOverlayTun(); err != nil {
+			log.Warnln("[Tailscale](%s) %v", option.Name, err)
+		} else {
+			outbound.overlayTun = device
+		}
+	}
+	var overlayTunDev tun.Device
+	if outbound.overlayTun != nil {
+		overlayTunDev = outbound.overlayTun.device()
+	}
 	outbound.server = &tsnet.Server{
+		Tun:        overlayTunDev,
 		Dir:        option.StateDir,
 		Hostname:   option.Hostname,
 		AuthKey:    option.AuthKey,
@@ -176,7 +196,8 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		Ephemeral:  option.Ephemeral,
 		SystemDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 			log.Debugln("[Tailscale](%s) SystemDialer: start dial %s %s", option.Name, network, address)
-			conn, err := outbound.dialer.DialContext(ctx, network, address)
+			target := underlayAddress(ctx, address)
+			conn, err := dialer.DialContext(ctx, network, target, underlayOptions(target)...)
 			log.Debugln("[Tailscale](%s) SystemDialer: finish dial %s %s, err: %v", option.Name, network, address, err)
 			return conn, err
 		},
@@ -320,6 +341,108 @@ func LogoutTailscale(name string) error {
 	return nil
 }
 
+// underlayAddress turns the name of a tailnet server into the address the host
+// resolves, so the connection leaves the machine instead of entering the proxy:
+// a name that reaches the tunnel is answered by the proxy's resolver, and a
+// proxied relay measures as far away as the proxy is. The tailnet's own peers are
+// already addresses and are left alone.
+const (
+	underlayResolver       = "223.5.5.5:53"
+	underlayResolveTimeout = 3 * time.Second
+)
+
+// underlayOptions binds a tailnet connection to the machine's own interface, so a
+// request to a foreign server leaves the host instead of being handed to the
+// proxy: the tun's routes would otherwise take it back into mihomo.
+func underlayOptions(address string) []dialer.Option {
+	destination, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return nil
+	}
+	if name := dialer.DefaultInterface.Load(); name != "" {
+		return []dialer.Option{dialer.WithInterface(name)}
+	}
+	if finder := dialer.DefaultInterfaceFinder.Load(); finder != nil {
+		if name := finder.FindInterfaceName(destination.Addr()); name != "" {
+			return []dialer.Option{dialer.WithInterface(name)}
+		}
+	}
+	return nil
+}
+
+func underlayAddress(ctx context.Context, address string) string {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return address
+	}
+	if _, parseErr := netip.ParseAddr(host); parseErr == nil {
+		return address
+	}
+	ip, ok := resolveUnderlay(ctx, host)
+	if !ok {
+		return address
+	}
+	return net.JoinHostPort(ip, port)
+}
+
+// underlayInterfaceOption is the interface a resolver socket is bound to, which
+// keeps the lookup itself out of the proxy.
+func underlayInterfaceOption() dialer.Option {
+	if name := dialer.DefaultInterface.Load(); name != "" {
+		return dialer.WithInterface(name)
+	}
+	if finder := dialer.DefaultInterfaceFinder.Load(); finder != nil {
+		if name := finder.FindInterfaceName(netip.MustParseAddr("223.5.5.5")); name != "" {
+			return dialer.WithInterface(name)
+		}
+	}
+	return dialer.WithInterface("")
+}
+
+// resolveUnderlay asks a plain resolver for a name, over a socket bound to the
+// machine's own interface: the proxy's resolver answers with an address that only
+// means something inside the tunnel, and a relay reached that way is measured
+// through the proxy rather than from here.
+func resolveUnderlay(ctx context.Context, host string) (string, bool) {
+	conn, err := dialer.DialContext(
+		ctx,
+		"udp",
+		underlayResolver,
+		underlayInterfaceOption(),
+	)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+	query := new(D.Msg)
+	query.SetQuestion(D.Fqdn(host), D.TypeA)
+	query.RecursionDesired = true
+	deadline := time.Now().Add(underlayResolveTimeout)
+	_ = conn.SetDeadline(deadline)
+	packed, packErr := query.Pack()
+	if packErr != nil {
+		return "", false
+	}
+	if _, err = conn.Write(packed); err != nil {
+		return "", false
+	}
+	buffer := make([]byte, 4096)
+	read, err := conn.Read(buffer)
+	if err != nil {
+		return "", false
+	}
+	reply := new(D.Msg)
+	if err = reply.Unpack(buffer[:read]); err != nil {
+		return "", false
+	}
+	for _, answer := range reply.Answer {
+		if record, ok := answer.(*D.A); ok {
+			return record.A.String(), true
+		}
+	}
+	return "", false
+}
+
 func tailscaleByName(name string) (*Tailscale, bool) {
 	proxy := tunnel.AllProxies()[name]
 	if proxy == nil {
@@ -355,11 +478,11 @@ func (t *Tailscale) status() (*TailscaleStatus, error) {
 	}
 	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 	defer cancel()
-	local, err := t.server.LocalClient()
+	client, err := t.server.LocalClient()
 	if err != nil {
 		return nil, err
 	}
-	self, err := local.Status(ctx)
+	self, err := client.Status(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +525,93 @@ func (t *Tailscale) status() (*TailscaleStatus, error) {
 	sort.Slice(status.Peers, func(i, j int) bool {
 		return status.Peers[i].Hostname < status.Peers[j].Hostname
 	})
+	probePeerLatency(ctx, client, status.Peers)
 	return status, nil
+}
+
+// probePeerLatency measures each reachable peer, a few at a time so a page that
+// asks for the list does not wait for the slowest machine in the tailnet. A peer
+// that does not answer keeps zero, which a list shows as unknown rather than as
+// a fast path.
+func probePeerLatency(ctx context.Context, client *local.Client, peers []TailscalePeer) {
+	const (
+		probeTimeout = 4 * time.Second
+		probeWorkers = 4
+	)
+	type probe struct {
+		index int
+		addr  netip.Addr
+	}
+	queue := make(chan probe, len(peers))
+	for index, peer := range peers {
+		if !peer.Online || len(peer.IPs) == 0 {
+			continue
+		}
+		addr, err := netip.ParseAddr(peer.IPs[0])
+		if err != nil {
+			continue
+		}
+		queue <- probe{index: index, addr: addr}
+	}
+	close(queue)
+	var wg sync.WaitGroup
+	for worker := 0; worker < probeWorkers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range queue {
+				if ctx.Err() != nil {
+					return
+				}
+				// A relayed path answers a disco ping only when both ends can
+				// reach each other directly, so the measurement falls back to the
+				// pings that travel over whatever path exists.
+				for _, kind := range []tailcfg.PingType{
+					tailcfg.PingDisco,
+					tailcfg.PingTSMP,
+					tailcfg.PingICMP,
+				} {
+					pingCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+					result, err := client.Ping(pingCtx, item.addr, kind)
+					cancel()
+					if err != nil || result == nil || result.LatencySeconds <= 0 {
+						log.Debugln("[Tailscale] ping %s (%v) failed: %v", item.addr, kind, err)
+						continue
+					}
+					peers[item.index].LatencyMs = int64(result.LatencySeconds * 1000)
+					break
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// applyOverlayTunAddress waits for the node to hold an address and puts it on the
+// device, which is what makes the tailnet's traffic local to this machine.
+func (t *Tailscale) applyOverlayTunAddress() {
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		if t.ctx.Err() != nil || t.overlayTun == nil {
+			return
+		}
+		v4, v6 := t.server.TailscaleIPs()
+		addresses := make([]netip.Prefix, 0, 2)
+		if v4.IsValid() {
+			addresses = append(addresses, netip.PrefixFrom(v4, 32))
+		}
+		if v6.IsValid() {
+			addresses = append(addresses, netip.PrefixFrom(v6, 128))
+		}
+		if len(addresses) > 0 {
+			if err := t.overlayTun.takeAddress(addresses); err != nil {
+				log.Warnln("[Tailscale](%s) %v", t.Name(), err)
+			}
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	log.Warnln("[Tailscale](%s) no address arrived for the overlay tun", t.Name())
 }
 
 // The exit node's status carries its addresses to dial; the peer entry of the
@@ -454,6 +663,11 @@ func (t *Tailscale) start() error {
 			return
 		}
 		t.serverStarted = true
+		if t.overlayTun != nil {
+			// The address is the control plane's to hand out and arrives with the
+			// netmap, which is not there when Start returns.
+			go t.applyOverlayTunAddress()
+		}
 		ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 		defer cancel()
 		if err := t.applyPrefs(ctx); err != nil {
@@ -859,6 +1073,12 @@ func (t *Tailscale) Close() error {
 	t.startOnce.Do(func() {
 		t.startErr = errors.New("tailscale outbound closed")
 	})
+	if t.overlayTun != nil {
+		if err := t.overlayTun.Close(); err != nil {
+			log.Warnln("[Tailscale](%s) overlay tun did not close: %v", t.Name(), err)
+		}
+		t.overlayTun = nil
+	}
 	if t.server != nil && t.serverStarted { // tsnet.Server.Close() must not be called before or concurrently with Start.
 		return t.server.Close()
 	}

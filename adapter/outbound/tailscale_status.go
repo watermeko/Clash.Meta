@@ -40,4 +40,8 @@ type TailscalePeer struct {
 	CurAddr string `json:"cur-addr"`
 	RxBytes int64  `json:"rx-bytes"`
 	TxBytes int64  `json:"tx-bytes"`
+	// Round trip the tailnet measured to this machine, zero when it could not be
+	// measured. A relayed path is slower than a direct one, which is exactly what
+	// a list has to show to be useful.
+	LatencyMs int64 `json:"latency-ms"`
 }

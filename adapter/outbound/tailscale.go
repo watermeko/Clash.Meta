@@ -198,6 +198,11 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 			log.Debugln("[Tailscale](%s) SystemDialer: start dial %s %s", option.Name, network, address)
 			target := underlayAddress(ctx, address)
 			conn, err := dialer.DialContext(ctx, network, target, underlayOptions(target)...)
+			if err != nil {
+				// The same privilege Android withholds: a bound dial fails
+				// outright there, and an unbound one is still better than none.
+				conn, err = dialer.DialContext(ctx, network, target)
+			}
 			log.Debugln("[Tailscale](%s) SystemDialer: finish dial %s %s, err: %v", option.Name, network, address, err)
 			return conn, err
 		},
@@ -252,6 +257,11 @@ func TailscaleStatusOf(name string) (*TailscaleStatus, error) {
 	return outbound.status()
 }
 
+// The longest a login waits for a node that is still starting before it says
+// so: longer than a control round trip, shorter than a login the user has
+// given up on.
+const loginSettleTimeout = 15 * time.Second
+
 // LoginTailscale asks the node for the URL a browser has to open. A node that
 // is already signed in has none, so it answers with the empty string rather
 // than an error.
@@ -261,7 +271,9 @@ func TailscaleStatusOf(name string) (*TailscaleStatus, error) {
 func LoginTailscale(name string) (string, error) {
 	outbound, ok := tailscaleByName(name)
 	if !ok {
-		return "", nil
+		// No node means no login to finish, and the empty answer would read as
+		// one that already is signed in.
+		return "", errors.New("tailscale: the node is not in the running config")
 	}
 	if err := outbound.start(); err != nil {
 		return "", err
@@ -279,13 +291,30 @@ func LoginTailscale(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// A node that has just been written into the config spends its first seconds
+	// starting, which is neither "signed in" nor "needs a login": waiting for it
+	// to settle is what keeps the answer honest.
 	status, err := local.Status(context.Background())
 	if err != nil {
 		return "", err
 	}
+	settleDeadline := time.Now().Add(loginSettleTimeout)
+	for status.BackendState == ipn.Starting.String() && time.Now().Before(settleDeadline) {
+		select {
+		case <-outbound.ctx.Done():
+			return "", outbound.ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+		if status, err = local.Status(context.Background()); err != nil {
+			return "", err
+		}
+	}
 	if status.AuthURL != "" {
 		outbound.setAuthURL(status.AuthURL)
 		return status.AuthURL, nil
+	}
+	if status.BackendState == ipn.Starting.String() || status.BackendState == ipn.NoState.String() {
+		return "", errors.New("tailscale: the node is still starting")
 	}
 	// A node that is signed in needs nothing, and asking would log it out.
 	if status.BackendState != ipn.NeedsLogin.String() && status.BackendState != ipn.Stopped.String() {
@@ -411,7 +440,14 @@ func resolveUnderlay(ctx context.Context, host string) (string, bool) {
 		underlayInterfaceOption(),
 	)
 	if err != nil {
-		return "", false
+		// Binding a socket to an interface is a privilege Android does not give
+		// an app, so the lookup runs unbound there rather than not at all: a
+		// name that never resolves here reaches the tailnet's own resolver,
+		// which answers with an address this host may have no route to.
+		conn, err = dialer.DialContext(ctx, "udp", underlayResolver)
+		if err != nil {
+			return "", false
+		}
 	}
 	defer conn.Close()
 	query := new(D.Msg)
